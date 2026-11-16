@@ -39,6 +39,7 @@ typedef struct {
 
     uint64_t nodes;
     int seldepth;
+    int root_depth;
     int thread_id;
 } ThreadData;
 
@@ -75,6 +76,11 @@ void init_search_tables(void) {
 void clear_search_history(void) {
     for (int t = 0; t < MAX_THREADS; ++t) {
         if (g_threads[t]) {
+            memset(g_threads[t]->killer_moves, 0, sizeof(g_threads[t]->killer_moves));
+            memset(g_threads[t]->history_moves, 0, sizeof(g_threads[t]->history_moves));
+            memset(g_threads[t]->capture_history, 0, sizeof(g_threads[t]->capture_history));
+            memset(g_threads[t]->cont_history, 0, sizeof(g_threads[t]->cont_history));
+            memset(g_threads[t]->counter_moves, 0, sizeof(g_threads[t]->counter_moves));
             memset(g_threads[t]->pawn_corrhist, 0, sizeof(g_threads[t]->pawn_corrhist));
             memset(g_threads[t]->non_pawn_corrhist, 0, sizeof(g_threads[t]->non_pawn_corrhist));
             memset(g_threads[t]->eval_cache, 0, sizeof(g_threads[t]->eval_cache));
@@ -121,14 +127,16 @@ static inline void check_time_and_input(SearchInfo* info, int nthreads) {
 }
 
 static inline void ensure_accumulator(ThreadData* td, int ply) {
-    if (td->acc_valid[ply]) return;
+    if (ply <= 0 || td->acc_valid[ply]) return;
 
     int valid_p = ply - 1;
     while (valid_p > 0 && !td->acc_valid[valid_p]) {
         valid_p--;
     }
+    if (valid_p < 0) valid_p = 0;
 
     for (int k = valid_p + 1; k <= ply; ++k) {
+        if (k <= 0 || k >= MAX_PLY) break;
         if (td->acc_move[k] == MOVE_NONE) {
             memcpy(td->w_acc_stack[k], td->w_acc_stack[k - 1], SHRA_D * sizeof(int16_t));
             memcpy(td->b_acc_stack[k], td->b_acc_stack[k - 1], SHRA_D * sizeof(int16_t));
@@ -337,31 +345,71 @@ static void score_moves(ThreadData* td, MoveList* list, int ply, Move tt_move,
             } else {
                 list->scores[i] = -10000 + see_score + (cap_hist / 16);
             }
-        } else if (promo == QUEEN) {
-            list->scores[i] = 28000;
-        } else if (move_gives_check_fast(board, move)) {
-            list->scores[i] = 26000;
-        } else if (move_is_castle(move)) {
-            list->scores[i] = 25000;
-        } else if (is_passed_pawn_push(board, move)) {
-            list->scores[i] = 22000;
-        } else if (k0 != MOVE_NONE && same_move_ft_p(move, k0)) {
-            list->scores[i] = 20000;
-        } else if (k1 != MOVE_NONE && same_move_ft_p(move, k1)) {
-            list->scores[i] = 18000;
-        } else if (counter_m != MOVE_NONE && same_move_ft_p(move, counter_m)) {
-            list->scores[i] = 16000;
+        } else if (promo != EMPTY) {
+            if (promo == QUEEN) list->scores[i] = 28000;
+            else if (promo == KNIGHT) list->scores[i] = 19000;
+            else list->scores[i] = -5000;
         } else {
-            int h = td->history_moves[us][from][to];
-            if (piece >= PAWN && piece <= KING) {
-                if (prev_piece >= PAWN && prev_piece <= KING) {
-                    h += td->cont_history[0][prev_piece][prev_to][piece][to];
-                }
-                if (prev2_piece >= PAWN && prev2_piece <= KING) {
-                    h += td->cont_history[1][prev2_piece][prev2_to][piece][to] / 2;
+            bool scored = false;
+            if (move_gives_check_fast(board, move)) {
+                if (!is_square_attacked(board, to, 1 - us) || see(board, move) >= 0) {
+                    list->scores[i] = 26000;
+                    scored = true;
                 }
             }
-            list->scores[i] = h;
+            if (!scored) {
+                if (move_is_castle(move)) {
+                    list->scores[i] = 25000;
+                } else if (is_passed_pawn_push(board, move)) {
+                    list->scores[i] = 22000;
+                } else if (k0 != MOVE_NONE && same_move_ft_p(move, k0)) {
+                    list->scores[i] = 20000;
+                } else if (k1 != MOVE_NONE && same_move_ft_p(move, k1)) {
+                    list->scores[i] = 18000;
+                } else if (counter_m != MOVE_NONE && same_move_ft_p(move, counter_m)) {
+                    list->scores[i] = 16000;
+                } else {
+                    int h = td->history_moves[us][from][to];
+                    if (piece >= PAWN && piece <= KING) {
+                        if (prev_piece >= PAWN && prev_piece <= KING) {
+                            h += td->cont_history[0][prev_piece][prev_to][piece][to];
+                        }
+                        if (prev2_piece >= PAWN && prev2_piece <= KING) {
+                            h += td->cont_history[1][prev2_piece][prev2_to][piece][to] / 2;
+                        }
+                    }
+                    list->scores[i] = h;
+                }
+            }
+        }
+    }
+}
+
+static void score_qmoves(const ThreadData* td, MoveList* list, Move tt_move, int* see_scores) {
+    const Board* board = &td->board;
+    for (int i = 0; i < list->count; ++i) {
+        Move move = list->moves[i];
+        int from = move_from(move);
+        int to = move_to(move);
+        int cap = move_captured(move);
+        int promo = move_promo(move);
+        int piece = board->board[from];
+
+        int s_val = (promo != EMPTY || (cap != EMPTY && piece_values[cap] < piece_values[piece]))
+                    ? see(board, move)
+                    : (piece_values[cap] - piece_values[piece]);
+        see_scores[i] = s_val;
+
+        if (tt_move != MOVE_NONE && same_move_ft_p(move, tt_move)) {
+            list->scores[i] = 60000;
+        } else if (s_val >= 0) {
+            int cap_hist = (cap != EMPTY && piece >= PAWN && piece <= KING && cap >= PAWN && cap <= KING)
+                           ? td->capture_history[piece][to][cap] : 0;
+            int s = 30000 + (piece_values[cap] * 10) - piece_values[piece] + s_val + (cap_hist / 16);
+            if (promo == QUEEN) s += 20000;
+            list->scores[i] = s;
+        } else {
+            list->scores[i] = -10000 + s_val;
         }
     }
 }
@@ -391,7 +439,39 @@ static inline Move pick_next_move(MoveList* list, int current_idx, int* out_scor
     return list->moves[current_idx];
 }
 
-static int quiescence(ThreadData* td, SearchInfo* info, int alpha, int beta, int ply, int nthreads) {
+static inline Move pick_next_move_q(MoveList* list, int* see_scores, int current_idx,
+                                    int* out_score, int* out_see) {
+    int best_idx = current_idx;
+    int best_score = list->scores[current_idx];
+
+    for (int i = current_idx + 1; i < list->count; ++i) {
+        if (list->scores[i] > best_score) {
+            best_score = list->scores[i];
+            best_idx = i;
+        }
+    }
+
+    if (best_idx != current_idx) {
+        Move tmp_m = list->moves[current_idx];
+        list->moves[current_idx] = list->moves[best_idx];
+        list->moves[best_idx] = tmp_m;
+
+        int tmp_s = list->scores[current_idx];
+        list->scores[current_idx] = list->scores[best_idx];
+        list->scores[best_idx] = tmp_s;
+
+        int tmp_see = see_scores[current_idx];
+        see_scores[current_idx] = see_scores[best_idx];
+        see_scores[best_idx] = tmp_see;
+    }
+
+    *out_score = best_score;
+    *out_see = see_scores[current_idx];
+    return list->moves[current_idx];
+}
+
+static int quiescence(ThreadData* td, SearchInfo* info, int alpha, int beta,
+                      int ply, int qply, bool is_pv, int nthreads) {
     if (__atomic_load_n(&info->stopped, __ATOMIC_RELAXED)) return 0;
 
     if (info->max_nodes > 0 && nthreads == 1 && td->nodes >= info->max_nodes) {
@@ -418,45 +498,67 @@ static int quiescence(ThreadData* td, SearchInfo* info, int alpha, int beta, int
     Board* board = &td->board;
     if (is_insufficient_material(board)) return 0;
 
-    bool in_check = is_square_attacked(board, board->king_sq[board->turn], 1 - board->turn);
-    int stand_pat = -INF;
-
-    if (!in_check) {
-        stand_pat = evaluate_node(td, ply);
-        if (stand_pat >= beta) return beta;
-        if (alpha < stand_pat) alpha = stand_pat;
-    }
-
-    MoveList list;
-    if (in_check) {
-        generate_moves(board, &list);
-    } else {
-        generate_tactical_moves(board, &list);
-    }
-
     Move tt_move = MOVE_NONE;
     int tt_s = 0, tt_d = 0, tt_f = 0;
     bool tt_cut = false;
     probe_tt_full(board->hash, 0, alpha, beta, ply, &tt_s, &tt_move, &tt_d, &tt_f, &tt_cut);
+    (void)tt_d;
+    (void)tt_f;
+    if (tt_cut && !is_pv) {
+        return tt_s;
+    }
 
-    score_moves(td, &list, ply, tt_move, MOVE_NONE, EMPTY, MOVE_NONE, EMPTY);
+    bool in_check = is_square_attacked(board, board->king_sq[board->turn], 1 - board->turn);
+    if (in_check && qply >= 16) {
+        return evaluate_node(td, ply);
+    }
+
+    int orig_alpha = alpha;
+    int best_score = -INF;
+    int stand_pat = -INF;
+
+    if (!in_check) {
+        stand_pat = evaluate_node(td, ply);
+        if (stand_pat >= beta) {
+            store_tt(board->hash, 0, TT_BETA, stand_pat, MOVE_NONE, ply);
+            return stand_pat;
+        }
+        best_score = stand_pat;
+        if (alpha < stand_pat) alpha = stand_pat;
+    }
+
+    MoveList list;
+    int see_scores[256];
+    if (in_check) {
+        generate_moves(board, &list);
+        score_moves(td, &list, ply, tt_move, MOVE_NONE, EMPTY, MOVE_NONE, EMPTY);
+    } else {
+        generate_tactical_moves(board, &list);
+        score_qmoves(td, &list, tt_move, see_scores);
+    }
 
     int legal_moves = 0;
+    Move best_move = MOVE_NONE;
 
     for (int i = 0; i < list.count; ++i) {
         int move_score = 0;
-        Move current_move = pick_next_move(&list, i, &move_score);
+        int see_val = 0;
+        Move current_move = in_check
+                            ? pick_next_move(&list, i, &move_score)
+                            : pick_next_move_q(&list, see_scores, i, &move_score, &see_val);
         (void)move_score;
 
         int from = move_from(current_move);
         int cap = move_captured(current_move);
         int promo = move_promo(current_move);
 
-        if (!in_check && promo == EMPTY) {
-            bool is_near_promo = (cap == EMPTY);
-            if (!is_near_promo) {
-                if (stand_pat + piece_values[cap] + 250 < alpha) continue;
-                if (piece_values[cap] < piece_values[board->board[from]] && see(board, current_move) < 0) continue;
+        if (!in_check) {
+            if (see_val < 0) continue;
+            int gain_est = piece_values[cap] + ((promo != EMPTY) ? (piece_values[promo] - piece_values[PAWN]) : 0);
+            if (stand_pat + gain_est + 200 < alpha) continue;
+        } else {
+            if (qply >= 6 && legal_moves > 0 && cap == EMPTY && promo == EMPTY && see(board, current_move) < 0) {
+                continue;
             }
         }
 
@@ -468,18 +570,29 @@ static int quiescence(ThreadData* td, SearchInfo* info, int alpha, int beta, int
 
         record_move_acc(td, ply, current_move, moving_piece, moving_color);
 
-        int score = -quiescence(td, info, -beta, -alpha, ply + 1, nthreads);
+        int score = -quiescence(td, info, -beta, -alpha, ply + 1, qply + 1, is_pv, nthreads);
         unmake_move(board, current_move, ply);
 
         if (__atomic_load_n(&info->stopped, __ATOMIC_RELAXED)) return 0;
 
-        if (score >= beta) return beta;
-        if (score > alpha) alpha = score;
+        if (score > best_score) {
+            best_score = score;
+            if (score > alpha) {
+                alpha = score;
+                best_move = current_move;
+                if (score >= beta) {
+                    store_tt(board->hash, 0, TT_BETA, best_score, best_move, ply);
+                    return best_score;
+                }
+            }
+        }
     }
 
     if (in_check && legal_moves == 0) return -MATE_SCORE + ply;
 
-    return alpha;
+    int tt_flag = (best_score > orig_alpha) ? TT_EXACT : TT_ALPHA;
+    store_tt(board->hash, 0, tt_flag, best_score, best_move, ply);
+    return best_score;
 }
 
 static int negamax(ThreadData* td, SearchInfo* info, int depth, int ply, int alpha, int beta,
@@ -499,7 +612,7 @@ static int negamax(ThreadData* td, SearchInfo* info, int depth, int ply, int alp
     }
     if (ply > td->seldepth) td->seldepth = ply;
 
-    if (depth <= 0) return quiescence(td, info, alpha, beta, ply, nthreads);
+    if (depth <= 0) return quiescence(td, info, alpha, beta, ply, 0, is_pv, nthreads);
 
     uint64_t new_nodes = td->nodes + 1;
     __atomic_store_n(&td->nodes, new_nodes, __ATOMIC_RELAXED);
@@ -547,7 +660,9 @@ static int negamax(ThreadData* td, SearchInfo* info, int depth, int ply, int alp
     }
 
     bool in_check = is_square_attacked(board, board->king_sq[board->turn], 1 - board->turn);
-    if (in_check) depth++;
+    if (in_check && ply < td->root_depth * 2 && depth < MAX_PLY - 4) {
+        depth++;
+    }
 
     if (!is_pv && !in_check && excluded_move == MOVE_NONE && depth >= 4 && tt_move == MOVE_NONE) {
         depth--;
@@ -573,6 +688,12 @@ static int negamax(ThreadData* td, SearchInfo* info, int depth, int ply, int alp
         }
     } else if (excluded_move == MOVE_NONE) {
         td->eval_stack[ply] = -INF;
+    }
+
+    if (!is_pv && !in_check && excluded_move == MOVE_NONE && depth <= 2 && eval + 350 * depth <= alpha) {
+        int r_score = quiescence(td, info, alpha, alpha + 1, ply, 0, false, nthreads);
+        if (__atomic_load_n(&info->stopped, __ATOMIC_RELAXED)) return 0;
+        if (r_score <= alpha) return r_score;
     }
 
     if (!is_pv && !in_check && excluded_move == MOVE_NONE && depth <= 6) {
@@ -632,16 +753,21 @@ static int negamax(ThreadData* td, SearchInfo* info, int depth, int ply, int alp
     if (!is_pv && !in_check && excluded_move == MOVE_NONE && depth >= 5 && abs(beta) < MATE_SCORE - MAX_PLY) {
         int pc_beta = beta + 180;
         int pc_depth = depth - 4;
+        int req_see = pc_beta - eval;
+        if (req_see < 1) req_see = 1;
+
         MoveList pc_list;
+        int pc_see[256];
         generate_tactical_moves(board, &pc_list);
-        score_moves(td, &pc_list, ply, tt_move, prev_m1, prev_piece, prev_m2, prev2_piece);
+        score_qmoves(td, &pc_list, tt_move, pc_see);
 
         for (int i = 0; i < pc_list.count; ++i) {
             int pc_ms = 0;
-            Move pc_m = pick_next_move(&pc_list, i, &pc_ms);
+            int pc_s_val = 0;
+            Move pc_m = pick_next_move_q(&pc_list, pc_see, i, &pc_ms, &pc_s_val);
             (void)pc_ms;
             if (move_captured(pc_m) == EMPTY && move_promo(pc_m) == EMPTY) continue;
-            if (see(board, pc_m) < pc_beta - eval) continue;
+            if (pc_s_val < req_see) continue;
 
             int from = move_from(pc_m);
             int mp = board->board[from];
@@ -658,7 +784,7 @@ static int negamax(ThreadData* td, SearchInfo* info, int depth, int ply, int alp
             if (__atomic_load_n(&info->stopped, __ATOMIC_RELAXED)) return 0;
             if (pc_score >= pc_beta) {
                 store_tt(board->hash, pc_depth, TT_BETA, pc_score, pc_m, ply);
-                return pc_beta;
+                return pc_score;
             }
         }
     }
@@ -696,21 +822,24 @@ static int negamax(ThreadData* td, SearchInfo* info, int depth, int ply, int alp
         int cap = move_captured(current_move);
 
         bool is_quiet = (cap == EMPTY && promo == EMPTY);
-        bool is_passer = is_passed_pawn_push(board, current_move);
+        bool is_passer = is_quiet && is_passed_pawn_push(board, current_move);
         bool is_castling = move_is_castle(current_move);
         bool gives_check = move_gives_check_fast(board, current_move);
+        bool bad_check = (is_quiet && gives_check &&
+                          is_square_attacked(board, to, 1 - board->turn) &&
+                          see(board, current_move) < 0);
         int to_rank = to / 8;
 
-        bool is_advanced_passer = is_passer && ((board->turn == WHITE && to_rank >= 5) ||
-                                                (board->turn == BLACK && to_rank <= 2));
+        bool is_advanced_passer = is_passer && ((board->turn == WHITE && to_rank == 6) ||
+                                                (board->turn == BLACK && to_rank == 1));
 
         if (!is_pv && !in_check && legal_moves > 0) {
-            if (is_quiet && !gives_check && !is_passer && !is_castling) {
+            if (is_quiet && (!gives_check || bad_check) && !is_passer && !is_castling) {
                 if (depth <= 5 && legal_moves >= lmp_move_count[depth]) continue;
                 if (depth <= 4 && eval + 120 * depth <= alpha) continue;
             }
 
-            if (is_quiet && !gives_check && !is_advanced_passer && depth <= 5 && legal_moves >= 2) {
+            if (is_quiet && !is_advanced_passer && depth <= 5 && (legal_moves >= 2 || bad_check)) {
                 if (board->board[from] > PAWN &&
                     is_square_attacked(board, to, 1 - board->turn) &&
                     see(board, current_move) < -80 * depth - 60) {
@@ -737,13 +866,15 @@ static int negamax(ThreadData* td, SearchInfo* info, int depth, int ply, int alp
 
             if (se_score < s_beta) {
                 extension = 1;
-                if (!is_pv && se_score < s_beta - 25 && depth < 14) {
+                if (!is_pv && !in_check && ply < td->root_depth * 2 &&
+                    se_score < s_beta - 25 && depth < 14) {
                     extension = 2;
                 }
             } else if (s_beta >= beta) {
                 return s_beta;
             }
-        } else if (is_advanced_passer && depth <= 8) {
+        } else if (is_advanced_passer && depth <= 6 && ply < td->root_depth * 2 &&
+                   !in_check && see(board, current_move) >= 0) {
             extension = 1;
         }
 
@@ -771,7 +902,7 @@ static int negamax(ThreadData* td, SearchInfo* info, int depth, int ply, int alp
         } else {
             int reduction = 0;
             if (depth >= 3 && legal_moves >= 3 && is_quiet && !in_check &&
-                !gives_check && !is_passer && !is_castling) {
+                (!gives_check || bad_check) && !is_advanced_passer && !is_castling) {
                 int d_idx = (depth < MAX_PLY) ? depth : MAX_PLY - 1;
                 int m_idx = (legal_moves < 64) ? legal_moves : 63;
                 reduction = lmr_table[d_idx][m_idx];
@@ -779,21 +910,23 @@ static int negamax(ThreadData* td, SearchInfo* info, int depth, int ply, int alp
                 if (!improving) reduction += 1;
                 if (!is_pv) reduction += 1;
                 if (move_score < 0) reduction += 1;
+                if (is_passer && reduction > 1) reduction -= 1;
 
                 if (reduction < 1) reduction = 1;
-                if (reduction > next_depth - 1) reduction = next_depth - 1;
+                if (next_depth <= 1) reduction = 0;
+                else if (reduction > next_depth - 1) reduction = next_depth - 1;
             }
 
             score = -negamax(td, info, next_depth - reduction, ply + 1, -alpha - 1, -alpha,
                              false, current_move, moving_piece, prev_m1, prev_piece,
                              MOVE_NONE, true, nthreads);
 
-            if (score > alpha && reduction > 0) {
+            if (!__atomic_load_n(&info->stopped, __ATOMIC_RELAXED) && score > alpha && reduction > 0) {
                 score = -negamax(td, info, next_depth, ply + 1, -alpha - 1, -alpha,
                                  false, current_move, moving_piece, prev_m1, prev_piece,
                                  MOVE_NONE, true, nthreads);
             }
-            if (score > alpha && score < beta) {
+            if (!__atomic_load_n(&info->stopped, __ATOMIC_RELAXED) && score > alpha && is_pv) {
                 score = -negamax(td, info, next_depth, ply + 1, -beta, -alpha,
                                  true, current_move, moving_piece, prev_m1, prev_piece,
                                  MOVE_NONE, true, nthreads);
@@ -885,7 +1018,7 @@ static int negamax(ThreadData* td, SearchInfo* info, int depth, int ply, int alp
                     if (excluded_move == MOVE_NONE) {
                         store_tt(board->hash, depth, TT_BETA, best_score, best_move_node, ply);
                     }
-                    return beta;
+                    return best_score;
                 }
             }
         }
@@ -917,15 +1050,38 @@ static void prepare_thread_state(ThreadData* td, const Board* board, int tid,
     td->thread_id = tid;
     td->nodes = 0;
     td->seldepth = 0;
+    td->root_depth = 1;
 
     memset(td->killer_moves, 0, sizeof(td->killer_moves));
-    memset(td->history_moves, 0, sizeof(td->history_moves));
-    memset(td->capture_history, 0, sizeof(td->capture_history));
-    memset(td->cont_history, 0, sizeof(td->cont_history));
-    memset(td->counter_moves, 0, sizeof(td->counter_moves));
     memset(td->eval_stack, 0, sizeof(td->eval_stack));
     memset(td->pv_table, 0, sizeof(td->pv_table));
     memset(td->pv_length, 0, sizeof(td->pv_length));
+
+    for (int c = 0; c < 2; ++c) {
+        for (int f = 0; f < 64; ++f) {
+            for (int t = 0; t < 64; ++t) {
+                td->history_moves[c][f][t] /= 2;
+            }
+        }
+    }
+    for (int p = 0; p < 7; ++p) {
+        for (int s = 0; s < 64; ++s) {
+            for (int cp = 0; cp < 7; ++cp) {
+                td->capture_history[p][s][cp] /= 2;
+            }
+        }
+    }
+    for (int i = 0; i < 2; ++i) {
+        for (int p1 = 0; p1 < 7; ++p1) {
+            for (int s1 = 0; s1 < 64; ++s1) {
+                for (int p2 = 0; p2 < 7; ++p2) {
+                    for (int s2 = 0; s2 < 64; ++s2) {
+                        td->cont_history[i][p1][s1][p2][s2] /= 2;
+                    }
+                }
+            }
+        }
+    }
 
     memcpy(td->w_acc_stack[0], base_w, SHRA_D * sizeof(int16_t));
     memcpy(td->b_acc_stack[0], base_b, SHRA_D * sizeof(int16_t));
@@ -990,6 +1146,7 @@ Move search_root(Board* board, SearchInfo* info) {
             int stability = 0;
 
             for (int depth = 1; depth <= info->depth; ++depth) {
+                td->root_depth = depth;
                 int alpha = -INF;
                 int beta  = INF;
                 int delta = 25;
@@ -1115,6 +1272,7 @@ Move search_root(Board* board, SearchInfo* info) {
             int helper_best = 0;
             int start_d = 1 + (tid % 2);
             for (int depth = start_d; depth <= info->depth; ++depth) {
+                td->root_depth = depth;
                 int alpha = -INF;
                 int beta  = INF;
                 int delta = 25 + (tid % 3) * 5;
