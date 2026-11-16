@@ -62,8 +62,8 @@ int get_hashfull(void) {
     uint8_t cur_age = g_tt_current_age & 0x3F;
     for (int i = 0; i < sample_size; ++i) {
         for (int j = 0; j < 4; ++j) {
-            uint64_t k = transposition_table[i].entry[j].key;
-            uint64_t d = transposition_table[i].entry[j].data;
+            uint64_t k = __atomic_load_n(&transposition_table[i].entry[j].key, __ATOMIC_RELAXED);
+            uint64_t d = __atomic_load_n(&transposition_table[i].entry[j].data, __ATOMIC_RELAXED);
             if (k != 0 || d != 0) {
                 uint8_t age = (uint8_t)((d >> 58) & 0x3F);
                 if (age == cur_age) count++;
@@ -87,8 +87,8 @@ bool probe_tt_full(U64 hash, int depth, int alpha, int beta, int ply,
     TT_Bucket* bucket = &transposition_table[tt_index(hash)];
 
     for (int i = 0; i < 4; ++i) {
-        uint64_t d = bucket->entry[i].data;
-        uint64_t k = bucket->entry[i].key;
+        uint64_t d = __atomic_load_n(&bucket->entry[i].data, __ATOMIC_RELAXED);
+        uint64_t k = __atomic_load_n(&bucket->entry[i].key, __ATOMIC_RELAXED);
         if ((k ^ d) == hash) {
             uint16_t move16 = (uint16_t)((d >> 32) & 0x7FFFU);
             int e_depth = (int)((d >> 48) & 0xFF);
@@ -134,8 +134,8 @@ void store_tt(U64 hash, int depth, int flags, int score, Move best, int ply) {
     int worst_value = 1000000;
 
     for (int i = 0; i < 4; ++i) {
-        uint64_t d = bucket->entry[i].data;
-        uint64_t k = bucket->entry[i].key;
+        uint64_t d = __atomic_load_n(&bucket->entry[i].data, __ATOMIC_RELAXED);
+        uint64_t k = __atomic_load_n(&bucket->entry[i].key, __ATOMIC_RELAXED);
 
         if (k == 0 && d == 0) {
             victim_idx = i;
@@ -148,10 +148,10 @@ void store_tt(U64 hash, int depth, int flags, int score, Move best, int ply) {
             if (move16 == 0) {
                 move16 = (uint16_t)((d >> 32) & 0x7FFFU);
             }
-            if (flags == TT_EXACT || depth + 2 >= old_depth || old_age != cur_age) {
+            if ((flags == TT_EXACT && old_depth <= depth + 3) || depth + 2 >= old_depth || old_age != cur_age) {
                 uint64_t new_data = pack_tt_data((int32_t)score, move16, depth, flags, cur_age);
-                bucket->entry[i].data = new_data;
-                bucket->entry[i].key = hash ^ new_data;
+                __atomic_store_n(&bucket->entry[i].data, new_data, __ATOMIC_RELAXED);
+                __atomic_store_n(&bucket->entry[i].key, hash ^ new_data, __ATOMIC_RELAXED);
             }
             return;
         }
@@ -167,6 +167,6 @@ void store_tt(U64 hash, int depth, int flags, int score, Move best, int ply) {
     }
 
     uint64_t new_data = pack_tt_data((int32_t)score, move16, depth, flags, cur_age);
-    bucket->entry[victim_idx].data = new_data;
-    bucket->entry[victim_idx].key = hash ^ new_data;
+    __atomic_store_n(&bucket->entry[victim_idx].data, new_data, __ATOMIC_RELAXED);
+    __atomic_store_n(&bucket->entry[victim_idx].key, hash ^ new_data, __ATOMIC_RELAXED);
 }
