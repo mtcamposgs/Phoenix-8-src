@@ -353,22 +353,26 @@ void generate_moves(const Board* board, MoveList* list) {
     while (k_moves) { int to = pop_lsb(&k_moves); add_move(list, k_from, to, board->board[to], EMPTY, false, false); }
 
     if (us == WHITE) {
-        if ((board->castling_rights & WK_CASTLE) && !(all_occ & ((1ULL << F1) | (1ULL << G1))) &&
-            !is_square_attacked(board, E1, BLACK) && !is_square_attacked(board, F1, BLACK) && !is_square_attacked(board, G1, BLACK)) {
-            add_move(list, E1, G1, EMPTY, EMPTY, false, true);
-        }
-        if ((board->castling_rights & WQ_CASTLE) && !(all_occ & ((1ULL << D1) | (1ULL << C1) | (1ULL << B1))) &&
-            !is_square_attacked(board, E1, BLACK) && !is_square_attacked(board, D1, BLACK) && !is_square_attacked(board, C1, BLACK)) {
-            add_move(list, E1, C1, EMPTY, EMPTY, false, true);
+        bool can_k = (board->castling_rights & WK_CASTLE) && !(all_occ & ((1ULL << F1) | (1ULL << G1)));
+        bool can_q = (board->castling_rights & WQ_CASTLE) && !(all_occ & ((1ULL << D1) | (1ULL << C1) | (1ULL << B1)));
+        if ((can_k || can_q) && !is_square_attacked(board, E1, BLACK)) {
+            if (can_k && !is_square_attacked(board, F1, BLACK) && !is_square_attacked(board, G1, BLACK)) {
+                add_move(list, E1, G1, EMPTY, EMPTY, false, true);
+            }
+            if (can_q && !is_square_attacked(board, D1, BLACK) && !is_square_attacked(board, C1, BLACK)) {
+                add_move(list, E1, C1, EMPTY, EMPTY, false, true);
+            }
         }
     } else {
-        if ((board->castling_rights & BK_CASTLE) && !(all_occ & ((1ULL << F8) | (1ULL << G8))) &&
-            !is_square_attacked(board, E8, WHITE) && !is_square_attacked(board, F8, WHITE) && !is_square_attacked(board, G8, WHITE)) {
-            add_move(list, E8, G8, EMPTY, EMPTY, false, true);
-        }
-        if ((board->castling_rights & BQ_CASTLE) && !(all_occ & ((1ULL << D8) | (1ULL << C8) | (1ULL << B8))) &&
-            !is_square_attacked(board, E8, WHITE) && !is_square_attacked(board, D8, WHITE) && !is_square_attacked(board, C8, WHITE)) {
-            add_move(list, E8, C8, EMPTY, EMPTY, false, true);
+        bool can_k = (board->castling_rights & BK_CASTLE) && !(all_occ & ((1ULL << F8) | (1ULL << G8)));
+        bool can_q = (board->castling_rights & BQ_CASTLE) && !(all_occ & ((1ULL << D8) | (1ULL << C8) | (1ULL << B8)));
+        if ((can_k || can_q) && !is_square_attacked(board, E8, WHITE)) {
+            if (can_k && !is_square_attacked(board, F8, WHITE) && !is_square_attacked(board, G8, WHITE)) {
+                add_move(list, E8, G8, EMPTY, EMPTY, false, true);
+            }
+            if (can_q && !is_square_attacked(board, D8, WHITE) && !is_square_attacked(board, C8, WHITE)) {
+                add_move(list, E8, C8, EMPTY, EMPTY, false, true);
+            }
         }
     }
 }
@@ -381,12 +385,10 @@ void generate_tactical_moves(const Board* board, MoveList* list) {
     U64 their_pieces = board->occupied[them];
     U64 all_occ = board->occupied[2];
     U64 ep_bb = (board->en_passant_square != NO_SQ) ? (1ULL << board->en_passant_square) : 0ULL;
-    U64 enemy_pawns = board->pieces[(us == WHITE ? 6 : 0) + PAWN - 1];
 
     U64 pawns = board->pieces[offset + PAWN - 1];
     int push_dir = (us == WHITE) ? 8 : -8;
     int promo_rank = (us == WHITE) ? 6 : 1;
-    int near_promo_rank = (us == WHITE) ? 5 : 2;
 
     while (pawns) {
         int from = pop_lsb(&pawns);
@@ -396,14 +398,6 @@ void generate_tactical_moves(const Board* board, MoveList* list) {
             int to = from + push_dir;
             if (to >= 0 && to < 64 && !(all_occ & (1ULL << to))) {
                 add_move(list, from, to, EMPTY, QUEEN, false, false);
-                add_move(list, from, to, EMPTY, ROOK, false, false);
-                add_move(list, from, to, EMPTY, BISHOP, false, false);
-                add_move(list, from, to, EMPTY, KNIGHT, false, false);
-            }
-        } else if (from_rank == near_promo_rank) {
-            int to = from + push_dir;
-            if (!(all_occ & (1ULL << to)) && (enemy_pawns & passed_pawn_masks[us][to]) == 0ULL) {
-                add_move(list, from, to, EMPTY, EMPTY, false, false);
             }
         }
 
@@ -414,9 +408,6 @@ void generate_tactical_moves(const Board* board, MoveList* list) {
             int cap_piece = is_ep ? PAWN : board->board[cap_to];
             if (from_rank == promo_rank) {
                 add_move(list, from, cap_to, cap_piece, QUEEN, is_ep, false);
-                add_move(list, from, cap_to, cap_piece, ROOK, is_ep, false);
-                add_move(list, from, cap_to, cap_piece, BISHOP, is_ep, false);
-                add_move(list, from, cap_to, cap_piece, KNIGHT, is_ep, false);
             } else {
                 add_move(list, from, cap_to, cap_piece, EMPTY, is_ep, false);
             }
