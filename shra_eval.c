@@ -33,6 +33,11 @@ static int32_t* g_fc2_b        = NULL; // [8 * 32]
 static int16_t* g_fc3_w        = NULL; // [8 * 32]
 static int32_t* g_fc3_b        = NULL; // [8]
 
+static int16_t g_chan_w_p01[16] __attribute__((aligned(32)));
+static int16_t g_chan_w_p23[16] __attribute__((aligned(32)));
+static int16_t g_chan_w_p45[16] __attribute__((aligned(32)));
+static int16_t g_chan_w_p67[16] __attribute__((aligned(32)));
+
 static size_t shra_expected_bytes(void) {
     return (size_t)SHRA_TOTAL_INPUTS * SHRA_D * sizeof(int16_t)
          + (size_t)SHRA_D * sizeof(int16_t)
@@ -105,6 +110,18 @@ static bool init_shra_from_memory(const uint8_t* data, size_t size) {
     LOAD_PART(g_fc3_b,        SHRA_PHASE_BUCKETS, int32_t);
 
     #undef LOAD_PART
+
+    for (int oc = 0; oc < SHRA_CHANNELS; ++oc) {
+        g_chan_w_p01[oc * 2 + 0] = g_chan_w[oc * 8 + 0];
+        g_chan_w_p01[oc * 2 + 1] = g_chan_w[oc * 8 + 1];
+        g_chan_w_p23[oc * 2 + 0] = g_chan_w[oc * 8 + 2];
+        g_chan_w_p23[oc * 2 + 1] = g_chan_w[oc * 8 + 3];
+        g_chan_w_p45[oc * 2 + 0] = g_chan_w[oc * 8 + 4];
+        g_chan_w_p45[oc * 2 + 1] = g_chan_w[oc * 8 + 5];
+        g_chan_w_p67[oc * 2 + 0] = g_chan_w[oc * 8 + 6];
+        g_chan_w_p67[oc * 2 + 1] = g_chan_w[oc * 8 + 7];
+    }
+
     return true;
 }
 
@@ -273,11 +290,11 @@ void shra_update_accumulators_move(Move move, int piece, int color, int w_ksq, i
     shra_update_single_move(move, piece, color, BLACK, b_ksq, in_b, in_psqt_b, out_b, out_psqt_b);
 }
 
-static inline __m128i screlu_qa128_128(__m128i x) {
-    __m128i zero = _mm_setzero_si128();
-    __m128i maxv = _mm_set1_epi16(SHRA_QA);
-    __m128i c = _mm_min_epi16(_mm_max_epi16(x, zero), maxv);
-    return _mm_srai_epi16(_mm_mullo_epi16(c, c), 7);
+static inline __m256i screlu_qa128_256(__m256i x) {
+    __m256i zero = _mm256_setzero_si256();
+    __m256i maxv = _mm256_set1_epi16(SHRA_QA);
+    __m256i c = _mm256_min_epi16(_mm256_max_epi16(x, zero), maxv);
+    return _mm256_srai_epi16(_mm256_mullo_epi16(c, c), 7);
 }
 
 static inline int32_t hsum_epi32(__m256i v) {
@@ -292,31 +309,36 @@ static inline int32_t hsum_epi32(__m256i v) {
 
 static void eval_perspective_avx2(const Board* board, int side, const int16_t* acc, uint8_t* out_feat) {
     int16_t z_buf[SHRA_D] __attribute__((aligned(32)));
-    memcpy(z_buf, acc, SHRA_D * sizeof(int16_t));
+    const int16_t* z_src = acc;
 
-    if (side == WHITE) {
-        if (board->castling_rights & WK_CASTLE) acc_add_i16(z_buf, &g_w_spatial[(SHRA_NUM_KING_FEATS + 0) * SHRA_D]);
-        if (board->castling_rights & WQ_CASTLE) acc_add_i16(z_buf, &g_w_spatial[(SHRA_NUM_KING_FEATS + 1) * SHRA_D]);
-        if (board->castling_rights & BK_CASTLE) acc_add_i16(z_buf, &g_w_spatial[(SHRA_NUM_KING_FEATS + 2) * SHRA_D]);
-        if (board->castling_rights & BQ_CASTLE) acc_add_i16(z_buf, &g_w_spatial[(SHRA_NUM_KING_FEATS + 3) * SHRA_D]);
-    } else {
-        if (board->castling_rights & BK_CASTLE) acc_add_i16(z_buf, &g_w_spatial[(SHRA_NUM_KING_FEATS + 0) * SHRA_D]);
-        if (board->castling_rights & BQ_CASTLE) acc_add_i16(z_buf, &g_w_spatial[(SHRA_NUM_KING_FEATS + 1) * SHRA_D]);
-        if (board->castling_rights & WK_CASTLE) acc_add_i16(z_buf, &g_w_spatial[(SHRA_NUM_KING_FEATS + 2) * SHRA_D]);
-        if (board->castling_rights & WQ_CASTLE) acc_add_i16(z_buf, &g_w_spatial[(SHRA_NUM_KING_FEATS + 3) * SHRA_D]);
-    }
-    if (board->en_passant_square != NO_SQ) {
-        acc_add_i16(z_buf, &g_w_spatial[(SHRA_NUM_KING_FEATS + 4) * SHRA_D]);
-    }
-    if (board->halfmove_clock > 0) {
-        int16_t hmc_q = (board->halfmove_clock >= 100) ? 64 : (int16_t)((board->halfmove_clock * 64) / 100);
-        __m256i v_hmc = _mm256_set1_epi16(hmc_q);
-        const int16_t* w_hmc = &g_w_spatial[(SHRA_NUM_KING_FEATS + 5) * SHRA_D];
-        for (int i = 0; i < SHRA_D; i += 16) {
-            __m256i vz = _mm256_load_si256((const __m256i*)&z_buf[i]);
-            __m256i vw = _mm256_load_si256((const __m256i*)&w_hmc[i]);
-            __m256i add = _mm256_srai_epi16(_mm256_mullo_epi16(vw, v_hmc), 6);
-            _mm256_store_si256((__m256i*)&z_buf[i], _mm256_adds_epi16(vz, add));
+    if (board->castling_rights != 0 || board->en_passant_square != NO_SQ || board->halfmove_clock > 0) {
+        memcpy(z_buf, acc, SHRA_D * sizeof(int16_t));
+        z_src = z_buf;
+
+        if (side == WHITE) {
+            if (board->castling_rights & WK_CASTLE) acc_add_i16(z_buf, &g_w_spatial[(SHRA_NUM_KING_FEATS + 0) * SHRA_D]);
+            if (board->castling_rights & WQ_CASTLE) acc_add_i16(z_buf, &g_w_spatial[(SHRA_NUM_KING_FEATS + 1) * SHRA_D]);
+            if (board->castling_rights & BK_CASTLE) acc_add_i16(z_buf, &g_w_spatial[(SHRA_NUM_KING_FEATS + 2) * SHRA_D]);
+            if (board->castling_rights & BQ_CASTLE) acc_add_i16(z_buf, &g_w_spatial[(SHRA_NUM_KING_FEATS + 3) * SHRA_D]);
+        } else {
+            if (board->castling_rights & BK_CASTLE) acc_add_i16(z_buf, &g_w_spatial[(SHRA_NUM_KING_FEATS + 0) * SHRA_D]);
+            if (board->castling_rights & BQ_CASTLE) acc_add_i16(z_buf, &g_w_spatial[(SHRA_NUM_KING_FEATS + 1) * SHRA_D]);
+            if (board->castling_rights & WK_CASTLE) acc_add_i16(z_buf, &g_w_spatial[(SHRA_NUM_KING_FEATS + 2) * SHRA_D]);
+            if (board->castling_rights & WQ_CASTLE) acc_add_i16(z_buf, &g_w_spatial[(SHRA_NUM_KING_FEATS + 3) * SHRA_D]);
+        }
+        if (board->en_passant_square != NO_SQ) {
+            acc_add_i16(z_buf, &g_w_spatial[(SHRA_NUM_KING_FEATS + 4) * SHRA_D]);
+        }
+        if (board->halfmove_clock > 0) {
+            int16_t hmc_q = (board->halfmove_clock >= 100) ? 64 : (int16_t)((board->halfmove_clock * 64) / 100);
+            __m256i v_hmc = _mm256_set1_epi16(hmc_q);
+            const int16_t* w_hmc = &g_w_spatial[(SHRA_NUM_KING_FEATS + 5) * SHRA_D];
+            for (int i = 0; i < SHRA_D; i += 16) {
+                __m256i vz = _mm256_load_si256((const __m256i*)&z_buf[i]);
+                __m256i vw = _mm256_load_si256((const __m256i*)&w_hmc[i]);
+                __m256i add = _mm256_srai_epi16(_mm256_mullo_epi16(vw, v_hmc), 6);
+                _mm256_store_si256((__m256i*)&z_buf[i], _mm256_adds_epi16(vz, add));
+            }
         }
     }
 
@@ -325,8 +347,8 @@ static void eval_perspective_avx2(const Board* board, int side, const int16_t* a
     const __m256i v256_127  = _mm256_set1_epi16(127);
 
     for (int i = 0; i < SHRA_GLOBAL_D; i += 32) {
-        __m256i z0 = _mm256_load_si256((const __m256i*)&z_buf[i]);
-        __m256i z1 = _mm256_load_si256((const __m256i*)&z_buf[i + 16]);
+        __m256i z0 = _mm256_load_si256((const __m256i*)&z_src[i]);
+        __m256i z1 = _mm256_load_si256((const __m256i*)&z_src[i + 16]);
 
         __m256i c0 = _mm256_min_epi16(_mm256_max_epi16(z0, v256_zero), v256_128);
         __m256i c1 = _mm256_min_epi16(_mm256_max_epi16(z1, v256_zero), v256_128);
@@ -338,152 +360,159 @@ static void eval_perspective_avx2(const Board* board, int side, const int16_t* a
         _mm256_store_si256((__m256i*)&out_feat[i], packed);
     }
 
-    __m128i h0_pad[12][12];
+    __m128i h0_pad[12][12] __attribute__((aligned(32)));
     memset(h0_pad, 0, sizeof(h0_pad));
 
-    __m128i rank_sum[8];
-    __m128i file_sum[8];
-    __m128i diag_sum[15];
-    __m128i adiag_sum[15];
+    __m128i rank_sum[8]   __attribute__((aligned(32)));
+    __m128i file_sum[8]   __attribute__((aligned(32)));
+    __m128i diag_sum[16]  __attribute__((aligned(32)));
+    __m128i adiag_sum[16] __attribute__((aligned(32)));
     for (int i = 0; i < 8; ++i) { rank_sum[i] = _mm_setzero_si128(); file_sum[i] = _mm_setzero_si128(); }
-    for (int i = 0; i < 15; ++i) { diag_sum[i] = _mm_setzero_si128(); adiag_sum[i] = _mm_setzero_si128(); }
+    for (int i = 0; i < 16; ++i) { diag_sum[i] = _mm_setzero_si128(); adiag_sum[i] = _mm_setzero_si128(); }
 
-    const int16_t* z_sp = &z_buf[SHRA_GLOBAL_D];
+    const int16_t* z_sp = &z_src[SHRA_GLOBAL_D];
     for (int r = 0; r < 8; ++r) {
-        for (int f = 0; f < 8; ++f) {
+        for (int f = 0; f < 8; f += 2) {
             int sq = r * 8 + f;
-            __m128i vz = _mm_load_si128((const __m128i*)&z_sp[sq * SHRA_CHANNELS]);
-            __m128i vh = screlu_qa128_128(vz);
-            h0_pad[r + 2][f + 2] = vh;
-            rank_sum[r]         = _mm_add_epi16(rank_sum[r], vh);
-            file_sum[f]         = _mm_add_epi16(file_sum[f], vh);
-            diag_sum[r - f + 7] = _mm_add_epi16(diag_sum[r - f + 7], vh);
-            adiag_sum[r + f]    = _mm_add_epi16(adiag_sum[r + f], vh);
+            __m256i vz = _mm256_load_si256((const __m256i*)&z_sp[sq * SHRA_CHANNELS]);
+            __m256i vh = screlu_qa128_256(vz);
+            _mm256_storeu_si256((__m256i*)&h0_pad[r + 2][f + 2], vh);
+
+            __m128i vh0 = _mm256_castsi256_si128(vh);
+            __m128i vh1 = _mm256_extracti128_si256(vh, 1);
+
+            rank_sum[r]             = _mm_add_epi16(rank_sum[r], _mm_add_epi16(vh0, vh1));
+            file_sum[f]             = _mm_add_epi16(file_sum[f], vh0);
+            file_sum[f + 1]         = _mm_add_epi16(file_sum[f + 1], vh1);
+            diag_sum[r - f + 7]     = _mm_add_epi16(diag_sum[r - f + 7], vh0);
+            diag_sum[r - f + 6]     = _mm_add_epi16(diag_sum[r - f + 6], vh1);
+            adiag_sum[r + f]        = _mm_add_epi16(adiag_sum[r + f], vh0);
+            adiag_sum[r + f + 1]    = _mm_add_epi16(adiag_sum[r + f + 1], vh1);
         }
     }
 
-    __m128i hgeo_pad[10][12];
-    for (int r = 0; r < 2; ++r)
-        for (int f = 0; f < 12; ++f)
-            hgeo_pad[r][f] = _mm_setzero_si128();
-    for (int r = 2; r < 10; ++r) {
-        hgeo_pad[r][0]  = _mm_setzero_si128();
-        hgeo_pad[r][1]  = _mm_setzero_si128();
-        hgeo_pad[r][10] = _mm_setzero_si128();
-        hgeo_pad[r][11] = _mm_setzero_si128();
+    __m128i hgeo_pad[12][12] __attribute__((aligned(32)));
+    memset(hgeo_pad, 0, sizeof(hgeo_pad));
+
+    const __m128i wlo_128 = _mm_load_si128((const __m128i*)g_w_line_ortho);
+    const __m128i wld_128 = _mm_load_si128((const __m128i*)g_w_line_diag);
+    const __m256i v256_wlo    = _mm256_inserti128_si256(_mm256_castsi128_si256(wlo_128), wlo_128, 1);
+    const __m256i v256_wld    = _mm256_inserti128_si256(_mm256_castsi128_si256(wld_128), wld_128, 1);
+    const __m256i v256_two    = _mm256_set1_epi16(2);
+    const __m256i v256_six    = _mm256_set1_epi16(6);
+    const __m256i v256_neg128 = _mm256_set1_epi16(-128);
+    const __m256i v256_pos128 = _mm256_set1_epi16(128);
+
+    #define LOAD256(ptr) _mm256_loadu_si256((const __m256i*)(ptr))
+
+    for (int r = 0; r < 8; ++r) {
+        int pr = r + 2;
+        __m256i rsum2 = _mm256_inserti128_si256(_mm256_castsi128_si256(rank_sum[r]), rank_sum[r], 1);
+        for (int f = 0; f < 8; f += 2) {
+            int pf = f + 2;
+            int sq = r * 8 + f;
+            __m256i vh0 = LOAD256(&h0_pad[pr][pf]);
+
+            __m256i o1 = _mm256_add_epi16(
+                _mm256_add_epi16(LOAD256(&h0_pad[pr + 1][pf]), LOAD256(&h0_pad[pr - 1][pf])),
+                _mm256_add_epi16(LOAD256(&h0_pad[pr][pf + 1]), LOAD256(&h0_pad[pr][pf - 1])));
+            __m256i o2 = _mm256_add_epi16(
+                _mm256_add_epi16(LOAD256(&h0_pad[pr + 2][pf]), LOAD256(&h0_pad[pr - 2][pf])),
+                _mm256_add_epi16(LOAD256(&h0_pad[pr][pf + 2]), LOAD256(&h0_pad[pr][pf - 2])));
+
+            __m256i dfwd = _mm256_add_epi16(LOAD256(&h0_pad[pr - 1][pf - 1]), LOAD256(&h0_pad[pr - 1][pf + 1]));
+            __m256i dbwd = _mm256_add_epi16(LOAD256(&h0_pad[pr + 1][pf - 1]), LOAD256(&h0_pad[pr + 1][pf + 1]));
+            __m256i d2 = _mm256_add_epi16(
+                _mm256_add_epi16(LOAD256(&h0_pad[pr + 2][pf + 2]), LOAD256(&h0_pad[pr + 2][pf - 2])),
+                _mm256_add_epi16(LOAD256(&h0_pad[pr - 2][pf + 2]), LOAD256(&h0_pad[pr - 2][pf - 2])));
+
+            __m256i kn1 = _mm256_add_epi16(
+                _mm256_add_epi16(LOAD256(&h0_pad[pr + 2][pf + 1]), LOAD256(&h0_pad[pr + 2][pf - 1])),
+                _mm256_add_epi16(LOAD256(&h0_pad[pr - 2][pf + 1]), LOAD256(&h0_pad[pr - 2][pf - 1])));
+            __m256i kn2 = _mm256_add_epi16(
+                _mm256_add_epi16(LOAD256(&h0_pad[pr + 1][pf + 2]), LOAD256(&h0_pad[pr + 1][pf - 2])),
+                _mm256_add_epi16(LOAD256(&h0_pad[pr - 1][pf + 2]), LOAD256(&h0_pad[pr - 1][pf - 2])));
+
+            __m256i sum_w2 = _mm256_mullo_epi16(_mm256_add_epi16(o1, dbwd), v256_two);
+            __m256i sum_w6 = _mm256_mullo_epi16(dfwd, v256_six);
+            __m256i sum_w1 = _mm256_add_epi16(o2, _mm256_add_epi16(d2, _mm256_add_epi16(kn1, kn2)));
+            __m256i local_ray = _mm256_srai_epi16(_mm256_add_epi16(sum_w1, _mm256_add_epi16(sum_w2, sum_w6)), 3);
+
+            __m256i vh2 = _mm256_slli_epi16(vh0, 1);
+            __m256i fsum2 = LOAD256(&file_sum[f]);
+            __m256i lo = _mm256_srai_epi16(_mm256_sub_epi16(_mm256_add_epi16(rsum2, fsum2), vh2), 3);
+
+            __m256i dsum2 = _mm256_inserti128_si256(_mm256_castsi128_si256(diag_sum[r - f + 7]), diag_sum[r - f + 6], 1);
+            __m256i asum2 = LOAD256(&adiag_sum[r + f]);
+            __m256i ld = _mm256_srai_epi16(_mm256_sub_epi16(_mm256_add_epi16(dsum2, asum2), vh2), 3);
+
+            __m256i lray = _mm256_add_epi16(
+                _mm256_srai_epi16(_mm256_mullo_epi16(lo, v256_wlo), 6),
+                _mm256_srai_epi16(_mm256_mullo_epi16(ld, v256_wld), 6));
+
+            __m256i geo_act = screlu_qa128_256(_mm256_adds_epi16(local_ray, lray));
+            __m256i wgeo = _mm256_load_si256((const __m256i*)&g_w_geo[sq * SHRA_CHANNELS]);
+            __m256i hgeo = _mm256_adds_epi16(vh0, _mm256_srai_epi16(_mm256_mullo_epi16(wgeo, geo_act), 6));
+            hgeo = _mm256_min_epi16(_mm256_max_epi16(hgeo, v256_neg128), v256_pos128);
+            _mm256_storeu_si256((__m256i*)&hgeo_pad[pr][pf], hgeo);
+        }
     }
 
-    const __m128i v_wlo = _mm_load_si128((const __m128i*)g_w_line_ortho);
-    const __m128i v_wld = _mm_load_si128((const __m128i*)g_w_line_diag);
-    const __m128i v_two = _mm_set1_epi16(2);
-    const __m128i v_six = _mm_set1_epi16(6);
-    const __m128i v_neg128 = _mm_set1_epi16(-128);
-    const __m128i v_pos128 = _mm_set1_epi16(128);
+    const __m256i v256_cb  = _mm256_load_si256((const __m256i*)g_chan_b);
+    const __m256i vw_p01   = _mm256_load_si256((const __m256i*)g_chan_w_p01);
+    const __m256i vw_p23   = _mm256_load_si256((const __m256i*)g_chan_w_p23);
+    const __m256i vw_p45   = _mm256_load_si256((const __m256i*)g_chan_w_p45);
+    const __m256i vw_p67   = _mm256_load_si256((const __m256i*)g_chan_w_p67);
+
+    const __m256i idx0 = _mm256_set1_epi32(0);
+    const __m256i idx1 = _mm256_set1_epi32(1);
+    const __m256i idx2 = _mm256_set1_epi32(2);
+    const __m256i idx3 = _mm256_set1_epi32(3);
+    const __m256i idx4 = _mm256_set1_epi32(4);
+    const __m256i idx5 = _mm256_set1_epi32(5);
+    const __m256i idx6 = _mm256_set1_epi32(6);
+    const __m256i idx7 = _mm256_set1_epi32(7);
 
     for (int r = 0; r < 8; ++r) {
         int pr = r + 2;
-        for (int f = 0; f < 8; ++f) {
+        for (int f = 0; f < 8; f += 2) {
             int pf = f + 2;
             int sq = r * 8 + f;
-            __m128i vh0 = h0_pad[pr][pf];
+            __m256i hg = LOAD256(&hgeo_pad[pr][pf]);
 
-            __m128i o1 = _mm_add_epi16(
-                _mm_add_epi16(h0_pad[pr + 1][pf], h0_pad[pr - 1][pf]),
-                _mm_add_epi16(h0_pad[pr][pf + 1], h0_pad[pr][pf - 1]));
-            __m128i o2 = _mm_add_epi16(
-                _mm_add_epi16(h0_pad[pr + 2][pf], h0_pad[pr - 2][pf]),
-                _mm_add_epi16(h0_pad[pr][pf + 2], h0_pad[pr][pf - 2]));
+            __m256i ts1 = _mm256_add_epi16(LOAD256(&hgeo_pad[pr - 1][pf - 1]), LOAD256(&hgeo_pad[pr - 1][pf + 1]));
+            __m256i ts2 = _mm256_add_epi16(LOAD256(&hgeo_pad[pr - 2][pf - 1]), LOAD256(&hgeo_pad[pr - 2][pf + 1]));
+            __m256i tac_shift = _mm256_srai_epi16(_mm256_add_epi16(ts1, ts2), 2);
+            __m256i tac_2d = screlu_qa128_256(_mm256_srai_epi16(_mm256_mullo_epi16(hg, tac_shift), 7));
 
-            __m128i dfwd = _mm_add_epi16(h0_pad[pr - 1][pf - 1], h0_pad[pr - 1][pf + 1]);
-            __m128i dbwd = _mm_add_epi16(h0_pad[pr + 1][pf - 1], h0_pad[pr + 1][pf + 1]);
-            __m128i d2 = _mm_add_epi16(
-                _mm_add_epi16(h0_pad[pr + 2][pf + 2], h0_pad[pr + 2][pf - 2]),
-                _mm_add_epi16(h0_pad[pr - 2][pf + 2], h0_pad[pr - 2][pf - 2]));
+            __m256i sum0 = v256_cb;
+            sum0 = _mm256_add_epi32(sum0, _mm256_madd_epi16(_mm256_permutevar8x32_epi32(hg, idx0), vw_p01));
+            sum0 = _mm256_add_epi32(sum0, _mm256_madd_epi16(_mm256_permutevar8x32_epi32(hg, idx1), vw_p23));
+            sum0 = _mm256_add_epi32(sum0, _mm256_madd_epi16(_mm256_permutevar8x32_epi32(hg, idx2), vw_p45));
+            sum0 = _mm256_add_epi32(sum0, _mm256_madd_epi16(_mm256_permutevar8x32_epi32(hg, idx3), vw_p67));
+            sum0 = _mm256_srai_epi32(sum0, 6);
 
-            __m128i kn1 = _mm_add_epi16(
-                _mm_add_epi16(h0_pad[pr + 2][pf + 1], h0_pad[pr + 2][pf - 1]),
-                _mm_add_epi16(h0_pad[pr - 2][pf + 1], h0_pad[pr - 2][pf - 1]));
-            __m128i kn2 = _mm_add_epi16(
-                _mm_add_epi16(h0_pad[pr + 1][pf + 2], h0_pad[pr + 1][pf - 2]),
-                _mm_add_epi16(h0_pad[pr - 1][pf + 2], h0_pad[pr - 1][pf - 2]));
+            __m256i sum1 = v256_cb;
+            sum1 = _mm256_add_epi32(sum1, _mm256_madd_epi16(_mm256_permutevar8x32_epi32(hg, idx4), vw_p01));
+            sum1 = _mm256_add_epi32(sum1, _mm256_madd_epi16(_mm256_permutevar8x32_epi32(hg, idx5), vw_p23));
+            sum1 = _mm256_add_epi32(sum1, _mm256_madd_epi16(_mm256_permutevar8x32_epi32(hg, idx6), vw_p45));
+            sum1 = _mm256_add_epi32(sum1, _mm256_madd_epi16(_mm256_permutevar8x32_epi32(hg, idx7), vw_p67));
+            sum1 = _mm256_srai_epi32(sum1, 6);
 
-            __m128i sum_w2 = _mm_mullo_epi16(_mm_add_epi16(o1, dbwd), v_two);
-            __m128i sum_w6 = _mm_mullo_epi16(dfwd, v_six);
-            __m128i sum_w1 = _mm_add_epi16(o2, _mm_add_epi16(d2, _mm_add_epi16(kn1, kn2)));
-            __m128i local_ray = _mm_srai_epi16(_mm_add_epi16(sum_w1, _mm_add_epi16(sum_w2, sum_w6)), 3);
+            __m256i chan_mix = _mm256_permute4x64_epi64(_mm256_packs_epi32(sum0, sum1), 0xD8);
 
-            __m128i vh2 = _mm_slli_epi16(vh0, 1);
-            __m128i lo = _mm_srai_epi16(_mm_sub_epi16(_mm_add_epi16(rank_sum[r], file_sum[f]), vh2), 3);
-            __m128i ld = _mm_srai_epi16(_mm_sub_epi16(_mm_add_epi16(diag_sum[r - f + 7], adiag_sum[r + f]), vh2), 3);
-            __m128i lray = _mm_add_epi16(
-                _mm_srai_epi16(_mm_mullo_epi16(lo, v_wlo), 6),
-                _mm_srai_epi16(_mm_mullo_epi16(ld, v_wld), 6));
+            __m256i tac_gate = screlu_qa128_256(_mm256_adds_epi16(tac_2d, chan_mix));
+            __m256i wtac = _mm256_load_si256((const __m256i*)&g_w_tac[sq * SHRA_CHANNELS]);
+            __m256i hfinal = _mm256_adds_epi16(hg, _mm256_srai_epi16(_mm256_mullo_epi16(wtac, tac_gate), 6));
+            hfinal = _mm256_min_epi16(_mm256_max_epi16(hfinal, v256_zero), v256_127);
 
-            __m128i geo_act = screlu_qa128_128(_mm_adds_epi16(local_ray, lray));
-            __m128i wgeo = _mm_load_si128((const __m128i*)&g_w_geo[sq * SHRA_CHANNELS]);
-            __m128i hgeo = _mm_adds_epi16(vh0, _mm_srai_epi16(_mm_mullo_epi16(wgeo, geo_act), 6));
-            hgeo = _mm_min_epi16(_mm_max_epi16(hgeo, v_neg128), v_pos128);
-            hgeo_pad[pr][pf] = hgeo;
+            __m128i packed2 = _mm_packus_epi16(_mm256_castsi256_si128(hfinal),
+                                               _mm256_extracti128_si256(hfinal, 1));
+            _mm_store_si128((__m128i*)&out_feat[SHRA_GLOBAL_D + sq * SHRA_CHANNELS], packed2);
         }
     }
 
-    const __m128i cb0 = _mm_load_si128((const __m128i*)&g_chan_b[0]);
-    const __m128i cb1 = _mm_load_si128((const __m128i*)&g_chan_b[4]);
-    const __m128i cw0 = _mm_load_si128((const __m128i*)&g_chan_w[0 * 8]);
-    const __m128i cw1 = _mm_load_si128((const __m128i*)&g_chan_w[1 * 8]);
-    const __m128i cw2 = _mm_load_si128((const __m128i*)&g_chan_w[2 * 8]);
-    const __m128i cw3 = _mm_load_si128((const __m128i*)&g_chan_w[3 * 8]);
-    const __m128i cw4 = _mm_load_si128((const __m128i*)&g_chan_w[4 * 8]);
-    const __m128i cw5 = _mm_load_si128((const __m128i*)&g_chan_w[5 * 8]);
-    const __m128i cw6 = _mm_load_si128((const __m128i*)&g_chan_w[6 * 8]);
-    const __m128i cw7 = _mm_load_si128((const __m128i*)&g_chan_w[7 * 8]);
-    const __m128i v_zero = _mm_setzero_si128();
-    const __m128i v_pos127 = _mm_set1_epi16(127);
-
-    __m128i hf_prev = _mm_setzero_si128();
-    for (int r = 0; r < 8; ++r) {
-        int pr = r + 2;
-        for (int f = 0; f < 8; ++f) {
-            int pf = f + 2;
-            int sq = r * 8 + f;
-            __m128i hg = hgeo_pad[pr][pf];
-
-            __m128i ts1 = _mm_add_epi16(hgeo_pad[pr - 1][pf - 1], hgeo_pad[pr - 1][pf + 1]);
-            __m128i ts2 = _mm_add_epi16(hgeo_pad[pr - 2][pf - 1], hgeo_pad[pr - 2][pf + 1]);
-            __m128i tac_shift = _mm_srai_epi16(_mm_add_epi16(ts1, ts2), 2);
-            __m128i tac_2d = screlu_qa128_128(_mm_srai_epi16(_mm_mullo_epi16(hg, tac_shift), 7));
-
-            __m128i p0 = _mm_madd_epi16(hg, cw0);
-            __m128i p1 = _mm_madd_epi16(hg, cw1);
-            __m128i p2 = _mm_madd_epi16(hg, cw2);
-            __m128i p3 = _mm_madd_epi16(hg, cw3);
-            __m128i s01 = _mm_hadd_epi32(p0, p1);
-            __m128i s23 = _mm_hadd_epi32(p2, p3);
-            __m128i sum03 = _mm_srai_epi32(_mm_add_epi32(_mm_hadd_epi32(s01, s23), cb0), 6);
-
-            __m128i p4 = _mm_madd_epi16(hg, cw4);
-            __m128i p5 = _mm_madd_epi16(hg, cw5);
-            __m128i p6 = _mm_madd_epi16(hg, cw6);
-            __m128i p7 = _mm_madd_epi16(hg, cw7);
-            __m128i s45 = _mm_hadd_epi32(p4, p5);
-            __m128i s67 = _mm_hadd_epi32(p6, p7);
-            __m128i sum47 = _mm_srai_epi32(_mm_add_epi32(_mm_hadd_epi32(s45, s67), cb1), 6);
-
-            __m128i chan_mix = _mm_packs_epi32(sum03, sum47);
-
-            __m128i tac_gate = screlu_qa128_128(_mm_adds_epi16(tac_2d, chan_mix));
-            __m128i wtac = _mm_load_si128((const __m128i*)&g_w_tac[sq * SHRA_CHANNELS]);
-            __m128i hfinal = _mm_adds_epi16(hg, _mm_srai_epi16(_mm_mullo_epi16(wtac, tac_gate), 6));
-            hfinal = _mm_min_epi16(_mm_max_epi16(hfinal, v_zero), v_pos127);
-
-            if ((f & 1) == 0) {
-                hf_prev = hfinal;
-            } else {
-                __m128i packed2 = _mm_packus_epi16(hf_prev, hfinal);
-                _mm_store_si128((__m128i*)&out_feat[SHRA_GLOBAL_D + (sq - 1) * SHRA_CHANNELS], packed2);
-            }
-        }
-    }
+    #undef LOAD256
 }
 
 int shra_evaluate_board(const Board* board,
@@ -492,7 +521,7 @@ int shra_evaluate_board(const Board* board,
                         ShraEvalCacheEntry* eval_cache) {
     U64 cache_key = board->hash ^ ((U64)board->halfmove_clock * 0x9E3779B97F4A7C15ULL);
     uint32_t c_idx = (uint32_t)(cache_key & (EVAL_CACHE_SIZE - 1));
-    if (eval_cache[c_idx].hash == cache_key) {
+    if (eval_cache && eval_cache[c_idx].hash == cache_key) {
         return eval_cache[c_idx].score;
     }
 
@@ -593,7 +622,9 @@ int shra_evaluate_board(const Board* board,
     int64_t total_q = (int64_t)psqt_out + (int64_t)net_out;
     int cp = (int)((total_q * (int64_t)SHRA_EVAL_SCALE) / 8192LL);
 
-    eval_cache[c_idx].hash = cache_key;
-    eval_cache[c_idx].score = cp;
+    if (eval_cache) {
+        eval_cache[c_idx].hash = cache_key;
+        eval_cache[c_idx].score = cp;
+    }
     return cp;
 }
