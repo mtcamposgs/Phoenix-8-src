@@ -132,6 +132,41 @@ static void trim_newline(char* s) {
     }
 }
 
+static void run_bench(int bench_depth) {
+    static const char* bench_fens[6] = {
+        "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1",
+        "r3k2r/p1ppqpb1/bn2pnp1/3PN3/1p2P3/2N2Q1p/PPPBBPPP/R3K2R w KQkq - 0 1",
+        "8/2p5/3p4/KP5r/1R3p1k/8/4P1P1/8 w - - 0 1",
+        "r3k2r/Pppp1ppp/1b3nbN/nP6/BBP1P3/q4N2/Pp1P2PP/R2Q1RK1 w kq - 0 1",
+        "rnbq1k1r/pp1Pbppp/2p5/8/2B5/8/PPP1NnPP/RNBQK2R w KQ - 1 8",
+        "4k3/8/8/4b3/8/4K3/p7/7Q w - - 0 1"
+    };
+
+    if (bench_depth < 1) bench_depth = 1;
+    if (bench_depth > 20) bench_depth = 20;
+
+    Board b;
+    uint64_t t0 = get_time_ms();
+    clear_tt();
+    clear_search_history();
+
+    for (int i = 0; i < 6; ++i) {
+        parse_fen(&b, bench_fens[i]);
+        b.game_ply = 0;
+        SearchInfo info = {0};
+        info.depth = bench_depth;
+        info.start_time = get_time_ms();
+        info.stop_time = info.start_time + 1000000000ULL;
+        new_search_tt();
+        printf("Bench position %d/6 (depth %d):\n", i + 1, bench_depth);
+        search_root(&b, &info);
+    }
+
+    uint64_t dt = get_time_ms() - t0;
+    printf("Bench finished in %llu ms.\n", (unsigned long long)dt);
+    fflush(stdout);
+}
+
 void uci_loop(void) {
     static char line[65536];
     Board board;
@@ -162,6 +197,14 @@ void uci_loop(void) {
         } else if (strcmp(line, "isready") == 0) {
             printf("readyok\n");
             fflush(stdout);
+        } else if (strcmp(line, "bench") == 0 || strncmp(line, "bench ", 6) == 0) {
+            int bd = 10;
+            if (strncmp(line, "bench ", 6) == 0) {
+                sscanf(line + 6, "%d", &bd);
+            }
+            run_bench(bd);
+            reset_board(&board);
+            position_valid = true;
         } else if (strncmp(line, "setoption ", 10) == 0) {
             char* name_ptr = strstr(line, "name ");
             if (!name_ptr) continue;
