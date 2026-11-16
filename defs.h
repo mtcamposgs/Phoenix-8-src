@@ -9,7 +9,7 @@
 #include <time.h>
 #include <math.h>
 
-#define ENGINE_NAME "Phoenix 8"
+#define ENGINE_NAME "Phoenix 9"
 #define ENGINE_AUTHOR "Matheus Campos"
 #define MAX_PLY 128
 #define MAX_THREADS 32
