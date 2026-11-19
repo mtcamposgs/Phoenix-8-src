@@ -1,1 +1,1 @@
-# Phoenix-8-src
+# Phoenix Chess Engine
