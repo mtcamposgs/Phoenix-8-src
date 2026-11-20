@@ -28,7 +28,7 @@ Phoenix is a developing engine.
 - Search heuristics including transposition-table move ordering, killer moves, history heuristics, null-move pruning, late-move reductions, and singular extensions.
 - Zobrist hashing and a configurable transposition table.
 - Multi-threaded search through OpenMP.
-- Quantized SHRA v5 neural evaluation with incremental accumulator updates and AVX2 operations.
+- Quantized SHRA neural evaluation with incremental accumulator updates and AVX2 operations.
 - Embedded default network, with an optional `EvalFile` UCI option for a compatible external network.
 - Built-in `bench` command covering six positions.
 
